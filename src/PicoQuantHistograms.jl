@@ -3,6 +3,11 @@ module PicoQuantHistograms
 using OrderedCollections
 using Tables
 
+
+abstract type FileFormat end
+struct PHUFile end
+struct PHDFile end
+
 abstract type TagType end
 struct TypeEmpty8 <: TagType end
 struct TypeBool8 <: TagType end
@@ -80,6 +85,7 @@ function readtag(io)
     tagid = strip(String(read(io, 32)), '\0')
     tagidx = read(io, Int32)
     tagtypecode = read(io, UInt32)
+    @debug "Tag" tagid tagidx tagtypecode
     dispatch_tag(readtag, tagtypecode, io, tagid, tagidx)
 end
 
@@ -127,10 +133,141 @@ function readtag(::TypeBinaryBlob, io, tagid, tagidx)
     Tag{TypeBinaryBlob}(tagid, tagidx, length, vals)
 end
 
+function readstringtags!(io, tags, string_tags)
+    for (tag, len) in string_tags
+        tags[tag] = Tag{TypeAsciiString}(tag, -1, len, rstrip(String(read(io, len)), '\0'))
+    end
+end
+
+function readint32tags!(io, tags, int32_tags)
+    for tag in int32_tags
+        tags[tag] = Tag{TypeInt8}(tag, -1, read(io, Int32), nothing)
+    end
+end
+
+function readfloat32tags!(io, tags, float32_tags)
+    for tag in float32_tags
+        tags[tag] = Tag{TypeFloat8}(tag, -1, read(io, Float32), nothing)
+    end
+end
+
+function readph20curve(io)
+    tags = OrderedDict{String, Tag}()
+    int32_tags = ["CurveIndex", "TimeOfRecording"]
+    readint32tags!(io, tags, int32_tags)
+    string_tags = [("HardwareIdent", 16), ("HardwareVersion", 8)]
+    readstringtags!(io, tags, string_tags)
+    int32_tags = [
+        "HardwareSerial", "SyncDivider", "CFDZeroCross0", "CFDLevel0", 
+        "CFDZeroCross1", "CFDLevel1", "Offset", "RoutingChannel", "ExtDevices", 
+        "MeasMode", "SubMode",
+    ]
+    readint32tags!(io, tags, int32_tags)
+    float32_tags = ["P1", "P2", "P3"]
+    readfloat32tags!(io, tags, float32_tags)
+    readint32tags!(io, tags, ["RangeNo"])
+    readfloat32tags!(io, tags, ["Resolution"])
+    int32_tags = [
+        "Channels", "AcquisitionTime", "StopAfter", "StopReason", 
+        "InpRate0", "InpRate1", "HistCountRate", 
+    ]
+    readint32tags!(io, tags, int32_tags)
+    tags["IntegralCount"] = Tag{TypeInt8}("IntegralCount", -1, read(io, Int64), nothing)
+    int32_tags = [
+        "Reserved", "DataOffset", "RouterModelCode", "RouterEnabled", "RtCh_InputType", 
+        "RtCh_InputLevel", "RtCh_InputEdge", "RtCh_CFDPresent", "RtCh_CFDLevel", 
+        "RtCh_CFDZeroCross", 
+    ]
+    readint32tags!(io, tags, int32_tags)
+    return tags
+end
+
+function readheadertags!(::PHDFile, io, tags)
+    string_tags = [
+        ("CreatorName", 18)
+        ("CreatorVersion", 12)
+        ("FileTime", 18)
+        ("CRLF", 2)
+        ("Comment", 256)
+    ]
+    readstringtags!(io, tags, string_tags)
+    int32_tags = [
+        "NumberOfCurves", "BitsPerRecord", "RoutingChannels", "NumberOfBoards", 
+        "ActiveCurve", "MeasurementMode", "SubMode", "RangeNo", "Offset", 
+        "AcquisitionTime", "StopAt", "StopOnOvfl", "Restart", "DisplayLinLog", 
+        "DisplayTimeAxisFrom", "DisplayTimeAxisTo", "DisplayCountAxisFrom", 
+        "DisplayCountAxisTo",
+    ]
+    readint32tags!(io, tags, int32_tags)
+    tags["RoutingChannels"] = Tag{TypeInt8}("RoutingChannels", -1, 4, nothing)
+    tags["DisplayCurve"] = [
+        OrderedDict([
+            "MapTo"=>Tag{TypeInt8}("MapTo", -1, read(io, Int32), nothing), 
+            "Show"=>Tag{TypeBool8}("Show", -1, read(io, Int32) ≠ 0, nothing)])
+    for _ in 1:8]
+    tags["Param"] = [
+        OrderedDict([
+            "Start"=>Tag{TypeFloat8}("Start", -1, read(io, Float32), nothing), 
+            "Step"=>Tag{TypeFloat8}("Step", -1, read(io, Float32), nothing), 
+            "Stop"=>Tag{TypeFloat8}("Stop", -1, read(io, Float32), nothing)
+        ])
+    for _ in 1:3]
+    int32_tags = [
+        "RepeatMode",
+        "RepeatsPerCurve",
+        "RepeatTime",
+        "RepeatWaitTime",
+    ]
+    readint32tags!(io, tags, int32_tags)
+    tags["ScriptName"] = Tag{TypeAsciiString}("ScriptName", 0, 20, rstrip(String(read(io, 20)), '\0'))
+    boards = []
+    for _ in 1:tags["NumberOfBoards"].value
+        board = OrderedDict{String, Union{Tag, OrderedDict, Vector}}()
+        board["HardwareIdent"] = Tag{TypeAsciiString}("HardwareIdent", -1, 16, rstrip(String(read(io, 16)), '\0'))
+        board["HardwareVersion"] = Tag{TypeAsciiString}("HardwareIdent", -1, 8, rstrip(String(read(io, 8)), '\0'))
+        int32_tags = [
+            "HardwareSerial", "SyncDivider", "CFDZeroCross0",
+            "CFDLevel0", "CFDZeroCross1", "CFDLevel1",
+        ]
+        readint32tags!(io, board, int32_tags)
+        board["Resolution"] = Tag{TypeFloat8}("Resolution", -1, read(io, Float32), nothing)
+        board["RouterModelCode"] = Tag{TypeInt8}("RouterModelCode", -1, read(io, Int32), nothing)
+        board["RouterEnabled"] = Tag{TypeInt8}("RouterEnabled", -1, read(io, Int32), nothing)
+        int32_tags = [
+            "InputType", "InputLevel", "InputEdge",
+            "CFDPresent", "CFDLevel", "CFDZCross",
+        ]
+        board["RouterChannel"] = [
+            OrderedDict([
+                tag => Tag{TypeInt8}(tag, -1, read(io, Int32), nothing)
+                for tag in int32_tags]) 
+            for _ in 1:tags["RoutingChannels"].value
+        ]
+        push!(boards, board)
+    end
+    tags["Board"] = boards
+    if tags["MeasurementMode"].value ≠ 0 # InteractiveMode
+        error("Unhandled measurement mode $(tags["MeasurementMode"]). TTTR files have not been implemented yet.")
+    end
+    @debug "Position before Curve" position(io)
+    tags["Curve"] = [readph20curve(io) for _ in 1:tags["NumberOfCurves"].value]
+    return nothing
+end
+
+function readheadertags!(::PHUFile, io, tags)
+    tag = readtag(io)
+    tags[tag.id] = tag
+    while !eof(io) && tag.id != "Header_End"
+        tag = readtag(io)
+        tags[tag.id] = tag
+    end
+    return nothing
+end
+
 struct Header
     magic::String
     version::String
-    tags::OrderedDict{String, Tag}
+    tags::OrderedDict{String, Union{Tag, OrderedDict, Vector}}
 end
 
 function Base.show(io::IO, h::Header)
@@ -142,14 +279,21 @@ end
 
 function readheader(io)
     seekstart(io)
-    magic = strip(String(read(io, 8)), '\0')
-    version = strip(String(read(io, 8)), '\0')
-    tags = OrderedDict{String, Tag}()
-    tag = readtag(io)
-    tags[tag.id] = tag
-    while !eof(io) && tag.id != "Header_End"
-        tag = readtag(io)
-        tags[tag.id] = tag
+    magic = rstrip(String(read(io, 8)), '\0')
+    version = ""
+    versionlength = 8
+    isphd = magic == "PicoHarp"
+    if isphd 
+        magic = magic * rstrip(String(read(io, 8)), '\0')
+        seek(io, 16)
+        versionlength = 6
+    end
+    version = strip(String(read(io, versionlength)), '\0')
+    tags = OrderedDict{String, Union{Tag, OrderedDict, Vector}}()
+    if isphd
+        readheadertags!(PHDFile(), io, tags)
+    else
+        readheadertags!(PHUFile(), io, tags)
     end
     Header(magic, version, tags)
 end
@@ -157,9 +301,24 @@ end
 Base.iterate(iter::Header) = iterate(iter.tags)
 Base.iterate(iter::Header, state) = iterate(iter.tags, state)
 Base.length(iter::Header) = length(iter.tags)
-Base.getindex(h::Header, i) = getindex(h.tags, i).value
+function Base.getindex(h::Header, i)
+    elem = getindex(h.tags, i)
+    if elem isa Tag
+        return elem.value
+    else
+        return elem
+    end
+end
 
 function readhisto(io, header)
+    if startswith(header.magic, "PicoHarp")
+        readhisto(PHDFile(), io, header)
+    else
+        readhisto(PHUFile(), io, header)
+    end
+end
+
+function readhisto(::PHUFile, io, header)
     N = header["HistResDscr_HistogramBins"]
     start = header["HistResDscr_DataOffset"]
     data = zeros(Int32, N)
@@ -168,9 +327,24 @@ function readhisto(io, header)
     data
 end
 
+function readhisto(::PHDFile, io, header)
+    numberofrows = collect(map(x->x["Channels"].value, header["Curve"]))
+    numberofdatarows = maximum(numberofrows)
+    counts = Array{Int32, 2}(undef, numberofdatarows, header["NumberOfCurves"])
+    for (i, rows) in enumerate(numberofrows)
+        @debug "Reading data" i rows
+        read!(io, @view(counts[1:rows, i]))
+    end
+    counts = Array{Union{Int32, Missing}, 2}(counts)
+    for (i, rows) in enumerate(numberofrows)
+        counts[rows+1:end, i] .= missing
+    end
+    return counts
+end
+
 struct PHisto
     header::Header
-    histo::Vector{Int32}
+    histo::AbstractArray{Union{Int32, Missing}}
 end
 
 Base.length(histo::PHisto) = length(histo.histo)
@@ -189,20 +363,50 @@ function Base.show(io::IO, h::PHisto)
 end
 
 # Tables.jl interface
-Tables.columnnames(::PHisto) = [:time, :count]
+function Tables.columnnames(t::PHisto)
+    header = getfield(t, :header)
+    if startswith(header.magic, "PicoHarp")
+        names = [Symbol("time$i") for i in 1:header["NumberOfCurves"]]
+        names = repeat(names, inner=2)
+        names[2:2:end] .= [Symbol("count$i") for i in 1:header["NumberOfCurves"]]
+        return names
+    else
+        return [:time, :count]
+    end
+end
 Tables.istable(::Type{PHisto}) = true
-Tables.schema(t::PHisto) = Tables.Schema(Tables.columnnames(t), [Float64, Int32])
+function Tables.schema(t::PHisto) 
+    names = Tables.columnnames(t)
+    Tables.Schema(names, repeat([Union{Float64, Missing}, Union{Int32, Missing}], outer=length(name)÷2))
+end
 Tables.columnaccess(::Type{PHisto}) = true
 Tables.columns(t::PHisto) = t
 Tables.getcolumn(t::PHisto, i) = Tables.getColumn(t, Tables.columnnames(t)[i])
 function Tables.getcolumn(t::PHisto, nm::Symbol) 
     if nm ∉ Tables.columnnames(t)
-        throw(ArgumentError("Column $nm does not exist for this TTR."))
+        throw(ArgumentError("Column $nm does not exist for this Histogram."))
     end
-    if nm == :time
-        time(t)
+    if startswith(t.header.magic, "PicoHarp")
+        name = string(nm)
+        requestingtime = startswith(name, "time")
+        if requestingtime
+            num = parse(Int, name[5:end])
+            nrows = t.header["Curve"][num]["Channels"].value
+            resolution = t.header["Curve"][num]["Resolution"].value * 1e-9
+            bins = Vector{Union{Float32, Missing}}(range(start=0, length=size(t.histo, 1), step=resolution))
+            bins[nrows+1:end] .= missing
+            return bins
+        else
+            num = parse(Int, name[6:end])
+            return t.histo[:, num]
+        end
+
     else
-        t.histo
+        if nm == :time
+            time(t)
+        else
+            t.histo
+        end
     end
 end
 function Base.getproperty(f::PHisto, sym::Symbol)
